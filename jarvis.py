@@ -52,6 +52,7 @@ import wave
 import webbrowser
 from pathlib import Path
 
+# pyrefly: ignore [missing-import]
 from dotenv import load_dotenv
 import numpy as np
 import sounddevice as sd
@@ -124,9 +125,7 @@ JARVIS_WELCOME_ENABLED = _parse_bool("JARVIS_WELCOME_ENABLED", True)
 JARVIS_WELCOME_PHRASE = (
     os.environ.get("JARVIS_WELCOME_PHRASE")
     or (
-        "hey Welcome back Guru shankar. "
-        "Here your workspace are opening now"
-        
+        "Welcome back sir, Raven is ready to go, workspace are opening now"        
     )
 ).strip()
 # Seconds after launching SONG_URI before speaking (gives Spotify/browser time to start).
@@ -229,7 +228,6 @@ def say_jarvis_welcome() -> None:
     if not JARVIS_WELCOME_ENABLED or not JARVIS_WELCOME_PHRASE.strip():
         return
     text = JARVIS_WELCOME_PHRASE.strip()
-    
     voice = (os.environ.get("EDGE_TTS_VOICE") or "en-US-AvaNeural").strip()
     
     cache_path = _jarvis_welcome_cache_path(text, voice)
@@ -247,7 +245,7 @@ def say_jarvis_welcome() -> None:
         
         async def fetch_and_save():
             communicate = edge_tts.Communicate(text, voice)
-            await communicate.save(str(cache_path))
+            await asyncio.wait_for(communicate.save(str(cache_path)), timeout=2.5)
             
         log.info("Fetching welcome speech from Edge TTS (voice: %s)...", voice)
         import concurrent.futures
@@ -856,20 +854,132 @@ def _focus_existing_vscode_window_win32() -> bool:
     return True
 
 
+def _get_workspace_state_path() -> Path:
+    return Path(__file__).resolve().parent / ".cache" / "workspace_state.txt"
+
+
+def is_workspace_active() -> bool:
+    path = _get_workspace_state_path()
+    if path.is_file():
+        try:
+            return path.read_text(encoding="utf-8").strip() == "open"
+        except Exception:
+            pass
+    return False
+
+
+def set_workspace_active(active: bool) -> None:
+    path = _get_workspace_state_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("open" if active else "closed", encoding="utf-8")
+    except Exception as e:
+        log.warning("Could not write workspace state: %s", e)
+
+
+def _close_app_windows_win32(exe_names: list[str]) -> None:
+    if sys.platform != "win32":
+        return
+    import ctypes
+    from ctypes import wintypes
+    
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    GW_OWNER = 4
+    GWL_EXSTYLE = -20
+    WS_EX_TOOLWINDOW = 0x00000080
+    WM_CLOSE = 0x0010
+    
+    exe_names_lower = [name.lower() for name in exe_names]
+    
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def _enum(hwnd: wintypes.HWND, _lp: wintypes.LPARAM) -> bool:
+        if user32.GetWindow(hwnd, GW_OWNER):
+            return True
+        if user32.GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW:
+            return True
+        if not user32.IsWindowVisible(hwnd) and not user32.IsIconic(hwnd):
+            return True
+            
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value == 0:
+            return True
+            
+        hproc = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+        if not hproc:
+            return True
+        try:
+            buf = ctypes.create_unicode_buffer(4096)
+            sz = wintypes.DWORD(len(buf))
+            if kernel32.QueryFullProcessImageNameW(hproc, 0, buf, ctypes.byref(sz)):
+                exe_name = os.path.basename(buf.value).lower()
+                if exe_name in exe_names_lower:
+                    log.info("Sending WM_CLOSE to window %d of process %s", hwnd, exe_name)
+                    user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+        finally:
+            kernel32.CloseHandle(hproc)
+        return True
+
+    user32.EnumWindows(_enum, 0)
+
+
+def say_jarvis_thank_you() -> None:
+    text = "Thank you sir."
+    log.info("Speaking thank you phrase: %s", text)
+    voice = (os.environ.get("EDGE_TTS_VOICE") or "en-US-AvaNeural").strip()
+    
+    cache_path = _jarvis_welcome_cache_path(text, voice)
+    if JARVIS_WELCOME_CACHE_ENABLED and cache_path.is_file():
+        log.info("Playing thank you from cache: %s", cache_path)
+        if _play_mp3_file(cache_path):
+            return
+            
+    try:
+        import asyncio
+        import edge_tts
+        
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        async def fetch_and_save():
+            communicate = edge_tts.Communicate(text, voice)
+            await asyncio.wait_for(communicate.save(str(cache_path)), timeout=2.5)
+            
+        log.info("Fetching thank you speech from Edge TTS...")
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future = executor.submit(asyncio.run, fetch_and_save())
+            future.result()
+            
+        _play_mp3_file(cache_path)
+    except Exception as e:
+        log.warning("Edge TTS thank you speech failed: %s. Falling back to native Windows TTS.", e)
+        _speak_native_windows(text)
+
+
 def run_double_clap_actions() -> None:
     """Run outside the mic loop so sleeps do not stall capture."""
-    play_song(SONG_URI)
-    for profile in CHROME_PROFILES:
-        open_chrome_profile(profile)
-        time.sleep(0.5)
-    open_teams()
-    if JARVIS_WELCOME_ENABLED and JARVIS_WELCOME_PHRASE.strip():
-        delay = max(0.0, JARVIS_AFTER_SONG_DELAY_S)
-        if delay:
-            time.sleep(delay)
-        threading.Thread(target=say_jarvis_welcome, name="WelcomeSpeechThread", daemon=True).start()
-    open_cursor_window()
-    open_vscode_window()
+    if is_workspace_active():
+        log.info("Workspace is active. Closing workspace...")
+        _close_app_windows_win32(["cursor.exe", "code.exe", "ms-teams.exe", "teams.exe", "chrome.exe", "spotify.exe"])
+        set_workspace_active(False)
+        threading.Thread(target=say_jarvis_thank_you, name="ThankYouSpeechThread", daemon=True).start()
+    else:
+        log.info("Workspace is inactive. Opening workspace...")
+        play_song(SONG_URI)
+        for profile in CHROME_PROFILES:
+            open_chrome_profile(profile)
+            time.sleep(0.5)
+        open_teams()
+        if JARVIS_WELCOME_ENABLED and JARVIS_WELCOME_PHRASE.strip():
+            delay = max(0.0, JARVIS_AFTER_SONG_DELAY_S)
+            if delay:
+                time.sleep(delay)
+            threading.Thread(target=say_jarvis_welcome, name="WelcomeSpeechThread", daemon=True).start()
+        open_cursor_window()
+        open_vscode_window()
+        set_workspace_active(True)
 
 
 def open_cursor_window() -> None:
@@ -950,9 +1060,9 @@ def main() -> int:
     if len(sys.argv) > 1 and sys.argv[1] == "--trigger":
         log.info("Triggering actions manually...")
         run_double_clap_actions()
-        # Wait for the welcome speech thread to finish before exiting
+        # Wait for the welcome or thank you speech thread to finish before exiting
         for t in threading.enumerate():
-            if t.name == "WelcomeSpeechThread":
+            if t.name in ("WelcomeSpeechThread", "ThankYouSpeechThread"):
                 t.join()
         return 0
 
